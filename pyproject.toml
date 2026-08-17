@@ -1,0 +1,126 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-production-platform"
+version = "1.0.0"
+description = "Production ML platform for B2B SaaS churn: point-in-time features, tracked experiments, promotion gates, drift monitoring and serving (synthetic data)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Ayman Bara", email = "aymanbara2005@gmail.com" }]
+keywords = ["machine-learning", "mlops", "churn", "feature-store", "model-registry"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+]
+
+dependencies = [
+    "numpy>=1.26,<3.0",
+    "pandas>=2.2,<3.0",
+    "scikit-learn>=1.4,<2.0",
+    "scipy>=1.12,<2.0",
+    "joblib>=1.3,<2.0",
+    "SQLAlchemy>=2.0,<3.0",
+    "psycopg[binary]>=3.1,<4.0",
+    "pydantic>=2.6,<3.0",
+    "pydantic-settings>=2.2,<3.0",
+    "mlflow-skinny>=2.12,<4.0",
+    "fastapi>=0.111,<1.0",
+    "uvicorn[standard]>=0.29,<1.0",
+    "httpx>=0.27,<1.0",
+    "typer>=0.12,<1.0",
+    "rich>=13.7,<14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-cov>=5.0,<7.0",
+    "ruff>=0.4,<1.0",
+    "mypy>=1.9,<2.0",
+    "pandas-stubs>=2.2,<3.0",
+    "matplotlib>=3.8,<4.0",
+    "nbformat>=5.10,<6.0",
+    "nbconvert>=7.16,<8.0",
+    "ipykernel>=6.29,<7.0",
+]
+
+[project.scripts]
+polaris = "polaris.cli:app"
+
+[project.urls]
+Repository = "https://github.com/legend-cell05/ml-production-platform"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+polaris = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "N", "SIM", "PTH", "RUF", "NPY", "PD"]
+ignore = [
+    "E501",    # the formatter owns line length
+    "B008",    # FastAPI dependency injection puts calls in defaults
+    "N803",    # X and y are the names every ML reader expects
+    "N806",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# N818 wants every exception to end in "Error". PromotionBlocked and
+# DataLeakage read better at the call site than their -Error forms.
+"src/polaris/exceptions.py" = ["N818"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+# No `python_version` pin: pinning it to the oldest supported runtime makes
+# mypy apply that version's grammar to the dependencies' stubs too, and some
+# ship PEP 695 syntax that only parses under 3.12. Mypy follows the interpreter
+# it runs under; 3.11 is exercised by the test matrix.
+files = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "mlflow.*", "joblib.*", "scipy.*", "matplotlib.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: requires a live PostgreSQL (set POLARIS_RUN_INTEGRATION=1)",
+    "slow: trains a model; excluded from the fast unit run",
+]
+
+[tool.coverage.run]
+source = ["src/polaris"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
