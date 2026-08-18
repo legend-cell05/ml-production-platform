@@ -90,9 +90,10 @@ tickets AS (
             WHERE t.priority = 'p1'
               AND t.opened_at >= CAST(:reference_date AS DATE) - 90
         )                                                         AS tickets_p1_90d,
-        COUNT(*) FILTER (
-            WHERE t.closed_at IS NULL OR t.closed_at >= CAST(:reference_date AS DATE)
-        )                                                         AS open_tickets,
+        -- Open tickets are counted by the CTE below, not here: a ticket open
+        -- for five hundred days is exactly the kind of thing that predicts
+        -- churn, and the 400-day lookback this CTE uses for its windowed
+        -- aggregates would silently drop it.
         AVG(
             EXTRACT(EPOCH FROM (t.closed_at - t.opened_at)) / 3600.0
         ) FILTER (
@@ -107,6 +108,18 @@ tickets AS (
     FROM ${SOURCE}.support_ticket t
     WHERE t.opened_at < CAST(:reference_date AS DATE)
       AND t.opened_at >= CAST(:reference_date AS DATE) - 400
+    GROUP BY t.account_id
+),
+-- Tickets still open as of the reference date, over ALL history rather than
+-- the 400-day window above. The distinction cost a failing test: an account
+-- with a ticket open since 2023 is not an account with no open tickets.
+open_tickets AS (
+    SELECT
+        t.account_id,
+        COUNT(*) AS open_tickets
+    FROM ${SOURCE}.support_ticket t
+    WHERE t.opened_at < CAST(:reference_date AS DATE)
+      AND (t.closed_at IS NULL OR t.closed_at >= CAST(:reference_date AS DATE))
     GROUP BY t.account_id
 ),
 
@@ -237,7 +250,7 @@ SELECT
 
     COALESCE(t.tickets_90d, 0),
     COALESCE(t.tickets_p1_90d, 0),
-    COALESCE(t.open_tickets, 0),
+    COALESCE(ot.open_tickets, 0),
     t.avg_resolution_hours_90d,
     t.avg_satisfaction_180d,
 
@@ -278,6 +291,7 @@ LEFT JOIN usage_28 u28 ON u28.account_id = e.account_id
 LEFT JOIN usage_90 u90 ON u90.account_id = e.account_id
 LEFT JOIN last_use lu  ON lu.account_id  = e.account_id
 LEFT JOIN tickets t    ON t.account_id   = e.account_id
+LEFT JOIN open_tickets ot ON ot.account_id = e.account_id
 LEFT JOIN billing b    ON b.account_id   = e.account_id
 LEFT JOIN nps n        ON n.account_id   = e.account_id
 LEFT JOIN events ev    ON ev.account_id  = e.account_id
