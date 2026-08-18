@@ -52,6 +52,17 @@ REVIEW_AUC = 0.90
 LEAK_MISSING_AUC = 0.80
 REVIEW_MISSING_AUC = 0.70
 
+# AUC on its own is not enough here, and the renewal-date bug is why. Fifty-nine
+# per cent of accounts legitimately have no renewal date -- they are on monthly
+# contracts -- and that legitimate missingness dilutes the AUC into the "worth
+# a look" band rather than "stop". The ratio between the label rate among
+# missing values and among present ones is not diluted by it: on a frame where
+# the date is missing for exactly the churners it runs into the thousands, while
+# the legitimate case in the current store sits at 3.4x. Both criteria run; the
+# worse verdict wins.
+LEAK_MISSING_LIFT = 8.0
+REVIEW_MISSING_LIFT = 3.0
+MIN_GROUP = 200
 
 
 @dataclass(frozen=True)
@@ -130,24 +141,55 @@ def screen_missingness(frame: pd.DataFrame) -> list[LeakageFinding]:
         if score is None:
             continue
 
-        verdict: Verdict = (
+        by_auc: Verdict = (
             "LEAK"
             if score >= LEAK_MISSING_AUC
             else "REVIEW"
             if score >= REVIEW_MISSING_AUC
             else "OK"
         )
+
+        missing_mask = present == 0
+        n_missing, n_present = int(missing_mask.sum()), int((~missing_mask).sum())
+        by_lift: Verdict = "OK"
+        lift = 1.0
+        lift_measured = n_missing >= MIN_GROUP and n_present >= MIN_GROUP
+        if lift_measured:
+            rate_missing = float(labels[missing_mask].mean())
+            rate_present = float(labels[~missing_mask].mean())
+            epsilon = 1.0 / len(labels)
+            lift = (rate_missing + epsilon) / (rate_present + epsilon)
+            extremity = max(lift, 1.0 / lift)
+            by_lift = (
+                "LEAK"
+                if extremity >= LEAK_MISSING_LIFT
+                else "REVIEW"
+                if extremity >= REVIEW_MISSING_LIFT
+                else "OK"
+            )
+
+        order: dict[Verdict, int] = {"OK": 0, "REVIEW": 1, "LEAK": 2}
+        verdict: Verdict = by_auc if order[by_auc] >= order[by_lift] else by_lift
         if verdict != "OK":
             missing_rate = 1.0 - float(present.mean())
+            extremity = max(lift, 1.0 / max(lift, 1e-9))
+            # A lift of "1.0x" when the groups were too small to compare would
+            # read as "the label rate is identical", which is a measurement
+            # nobody made. Say which of the two criteria actually ran.
+            lift_phrase = (
+                f"the label rate is {extremity:.1f}x different between missing and present"
+                if lift_measured
+                else (f"the label rates were not compared (one side has under {MIN_GROUP} rows)")
+            )
             findings.append(
                 LeakageFinding(
                     feature=name,
                     screen="missingness",
-                    score=score,
+                    score=max(score, min(1.0, 0.5 + 0.05 * extremity)),
                     verdict=verdict,
                     detail=(
-                        f"presence alone separates the classes at AUC {score:.3f} "
-                        f"({missing_rate:.1%} missing)"
+                        f"presence alone separates the classes at AUC {score:.3f}; "
+                        f"{lift_phrase} ({missing_rate:.1%} missing)"
                     ),
                 )
             )
