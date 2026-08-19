@@ -11,7 +11,9 @@ because of a way a model can look better than it is.
 3. **No segment regresses.** The check this project exists to demonstrate. A
    challenger can be better overall and worse for enterprise accounts -- and
    enterprise accounts are worth ten times the others, so the average is the
-   wrong thing to look at.
+   wrong thing to look at. A segment is only judged when it has enough
+   positive examples to be judged; four churns cannot support a decision, and
+   a gate that blocks on four churns is a gate that gets switched off.
 4. **The probabilities are probabilities.** The decision threshold is an
    expected-value calculation, and an expected value computed from an
    uncalibrated score is arithmetic on a number that does not mean what it
@@ -41,6 +43,12 @@ from polaris.logging_config import get_logger
 from polaris.registry.store import ModelRecord, get_production, segment_metrics, set_stage
 
 logger = get_logger(__name__)
+
+# A segment with fewer positives than this is reported as "not evaluable"
+# rather than compared. With four churns, the difference between two PR-AUCs
+# is noise, and blocking on it teaches everyone to use --force.
+MIN_SEGMENT_POSITIVES = 20
+
 
 @dataclass(frozen=True)
 class Check:
@@ -169,13 +177,25 @@ def evaluate_gate(
             if segment == "overall" or segment not in champion_segments:
                 continue
             champion_value, _ = champion_segments[segment]
+            positives = challenger_segments[segment][1]
+            if positives < MIN_SEGMENT_POSITIVES:
+                continue  # not enough evidence to judge; reported below
             judged += 1
             drop = champion_value - value
             if drop > settings.max_segment_regression:
                 regressions.append(f"{segment} {value:.4f} vs {champion_value:.4f} (-{drop:.4f})")
-        detail = f"{judged} segment(s) compared; " + (
+        not_judged = [
+            segment
+            for segment, (_, positives) in challenger_segments.items()
+            if segment != "overall" and positives < MIN_SEGMENT_POSITIVES
+        ]
+        detail = f"{judged} segment(s) judged; " + (
             f"regressions: {', '.join(regressions)}" if regressions else "none regressed"
         )
+        if not_judged:
+            detail += f"; not evaluable (under {MIN_SEGMENT_POSITIVES} positives): " + ", ".join(
+                sorted(not_judged)
+            )
         decision.checks.append(
             Check(
                 name="no_segment_regression",
