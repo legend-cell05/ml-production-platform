@@ -1,0 +1,483 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Static analysis -- fast, no database, fails the pipeline early.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: python -m ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: python -m ruff format --check .
+
+      - name: mypy
+        run: python -m mypy
+
+  # ---------------------------------------------------------------------------
+  # 2. The feature contract is the thing four different layers agree on:
+  #    training column selection, the serving payload, the drift monitor and
+  #    the docs. It gets its own gate, because a contract that only the tests
+  #    know about is not a contract. This job needs no database -- it compares
+  #    the Python definitions against the DDL as text.
+  # ---------------------------------------------------------------------------
+  contract:
+    name: Validate the feature contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: The contract and the feature store must describe the same columns
+        run: |
+          python - <<'PY'
+          import re, sys
+          from pathlib import Path
+
+          from polaris.features.definitions import (
+              EXCLUDED_COLUMNS, FEATURE_NAMES, FEATURE_VERSION,
+          )
+
+          ddl = Path("sql/schema/003_features.sql").read_text(encoding="utf-8")
+          body = ddl.split("CREATE TABLE IF NOT EXISTS ${FEATURES}.churn_features (", 1)[1]
+          columns = []
+          for line in body.splitlines():
+              line = line.split("--", 1)[0].strip()
+              if not line or line.startswith((")", "PRIMARY KEY", "CONSTRAINT")):
+                  continue
+              match = re.match(r"^([a-z_][a-z0-9_]*)\s+[A-Z]", line)
+              if match:
+                  columns.append(match.group(1))
+
+          declared = set(FEATURE_NAMES) | set(EXCLUDED_COLUMNS)
+          stored = set(columns)
+
+          problems = []
+          # A feature the model may use but the store does not hold is a
+          # KeyError at training time; a stored column that nothing classifies
+          # is a feature somebody forgot to declare -- or to exclude.
+          for name in sorted(declared - stored):
+              problems.append(f"declared in Python but not in the feature store: {name}")
+          for name in sorted(stored - declared):
+              problems.append(f"in the feature store but neither a feature nor excluded: {name}")
+          if problems:
+              print("\n".join(problems)); sys.exit(1)
+          print(f"feature contract {FEATURE_VERSION}: {len(FEATURE_NAMES)} features, "
+                f"{len(EXCLUDED_COLUMNS)} columns deliberately withheld, "
+                f"{len(columns)} columns in the store -- all reconciled")
+          PY
+
+      - name: No excluded column may reach the model matrix
+        run: |
+          python - <<'PY'
+          import sys
+          from polaris.features.definitions import EXCLUDED_COLUMNS, FEATURE_NAMES
+          from polaris.training.pipelines import build_pipeline
+
+          # The transformer's column lists are the last line of defence: this
+          # asserts that nothing excluded is named by any of them, so an
+          # identifier or the label itself cannot become a predictor.
+          used: set[str] = set()
+          for _, _, cols in build_pipeline("gradient_boosting").named_steps["prep"].transformers:
+              used |= set(cols)
+          leaked = sorted(used & set(EXCLUDED_COLUMNS))
+          if leaked:
+              print("excluded columns reached the pipeline: " + ", ".join(leaked)); sys.exit(1)
+          unknown = sorted(used - set(FEATURE_NAMES))
+          if unknown:
+              print("pipeline names columns absent from the contract: " + ", ".join(unknown))
+              sys.exit(1)
+          print(f"{len(used)} columns enter the model, every one of them declared")
+          PY
+
+      - name: The contract tests
+        run: python -m pytest tests/unit/test_contract.py -v
+
+  # ---------------------------------------------------------------------------
+  # 3. Tests -- unit tests on every supported Python, integration tests against
+  #    a real PostgreSQL service container. The point-in-time SQL is the thing
+  #    under test; mocking the database would prove nothing about it.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: polaris_test
+          POSTGRES_USER: polaris_app
+          # Test-only credential for an ephemeral container destroyed with the
+          # job and unreachable from outside the runner.
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polaris_app -d polaris_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      POLARIS_DB_HOST: localhost
+      POLARIS_DB_PORT: 5432
+      POLARIS_DB_NAME: polaris_test
+      POLARIS_DB_USER: polaris_app
+      POLARIS_DB_PASSWORD: ci_test_password
+      POLARIS_RUN_INTEGRATION: "1"
+      POLARIS_LOG_LEVEL: WARNING
+      POLARIS_MLFLOW_TRACKING_URI: sqlite:///mlflow-ci.db
+      # Enough accounts for the temporal split and the segment metrics to be
+      # meaningful, few enough that the job finishes in minutes.
+      POLARIS_N_ACCOUNTS: "800"
+      POLARIS_HISTORY_MONTHS: "24"
+      # scikit-learn and OpenBLAS both try to use every core; on a 2-core
+      # runner that costs more in contention than it wins in parallelism.
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: python -m pytest tests/unit -v --junitxml=junit-unit.xml
+
+      - name: Integration tests
+        run: python -m pytest tests/integration -v --junitxml=junit-integration.xml
+
+      - name: Coverage
+        if: matrix.python-version == '3.12'
+        run: python -m pytest tests --cov --cov-report=xml --cov-report=term-missing
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            junit-*.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 4. End-to-end -- the whole lifecycle, on generated data, asserting the
+  #    properties the README claims: the leakage screen is clean, the
+  #    promotion gate refuses a candidate that does not earn promotion, and
+  #    every prediction is logged with the version that made it.
+  # ---------------------------------------------------------------------------
+  lifecycle:
+    name: End-to-end lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, contract]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: polaris
+          POSTGRES_USER: polaris_app
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polaris_app -d polaris"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      POLARIS_DB_HOST: localhost
+      POLARIS_DB_PORT: 5432
+      POLARIS_DB_NAME: polaris
+      POLARIS_DB_USER: polaris_app
+      POLARIS_DB_PASSWORD: ci_test_password
+      POLARIS_LOG_LEVEL: INFO
+      POLARIS_MLFLOW_TRACKING_URI: sqlite:///mlflow-ci.db
+      POLARIS_N_ACCOUNTS: "1200"
+      POLARIS_HISTORY_MONTHS: "24"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Configuration and connectivity
+        run: polaris doctor
+
+      - name: Generate the simulated business
+        run: polaris simulate
+
+      - name: Build the point-in-time features
+        run: polaris build-features
+
+      - name: The most recent reference dates must carry features and no label
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+          from polaris.config import get_settings
+          from polaris.db.engine import get_engine
+
+          settings = get_settings()
+          with get_engine(settings).connect() as connection:
+              rows = connection.execute(text(f"""
+                  SELECT reference_date,
+                         COUNT(*) AS rows,
+                         COUNT(churned_in_horizon) AS labelled
+                    FROM {settings.feature_schema}.churn_features
+                   GROUP BY reference_date
+                   ORDER BY reference_date DESC
+                   LIMIT 3
+              """)).mappings().all()
+
+          # A label is only knowable once the horizon has elapsed. If the most
+          # recent reference date were labelled, the label would have been
+          # computed from the future -- the defect this whole design exists to
+          # prevent.
+          newest = rows[0]
+          assert newest["rows"] > 0, "the newest reference date has no features"
+          assert newest["labelled"] == 0, (
+              f"{newest['reference_date']} carries {newest['labelled']} labels, "
+              "but the horizon has not elapsed there"
+          )
+          print(f"{newest['reference_date']}: {newest['rows']} rows, 0 labels -- correct")
+          PY
+
+      - name: No feature may look like a leak
+        # A LEAK verdict is a non-zero exit; a REVIEW is printed and allowed,
+        # because "a human should look at this once" is not a build failure.
+        run: polaris screen
+
+      - name: Train and ship the first model
+        run: polaris train --algorithm logistic --promote
+
+      - name: Train a challenger
+        run: polaris train --algorithm gradient_boosting
+
+      - name: A challenger that does not earn promotion must be refused
+        env:
+          # Deliberately unreachable: no model beats its champion by 0.90
+          # PR-AUC. This asserts the gate's mechanism and its exit code
+          # without depending on which algorithm happens to win on a sample
+          # this size -- which would make the assertion a coin toss.
+          POLARIS_MIN_PR_AUC_GAIN: "0.90"
+        run: |
+          set +e
+          polaris promote 2
+          code=$?
+          set -e
+          # Exit code 3 is "blocked by a gate", not "crashed". A scheduler has
+          # to be able to tell those apart without parsing text.
+          if [ "$code" -ne 3 ]; then
+            echo "expected exit code 3 (blocked), got $code"; exit 1
+          fi
+          echo "the gate refused the challenger, as designed"
+
+      - name: The refused version must not be serving
+        run: |
+          python - <<'PY'
+          from polaris.config import get_settings
+          from polaris.registry.store import get_production
+
+          production = get_production("churn-60d", get_settings())
+          assert production is not None, "nothing is in production"
+          assert production.version == 1, (
+              f"v{production.version} is serving -- a refused promotion changed production"
+          )
+          print("v1 is still serving; the refusal changed nothing")
+          PY
+
+      - name: Promote the challenger under the real gate
+        # --force so the job does not depend on which algorithm wins on a
+        # sample this size; the override and its reason are recorded either
+        # way, which is the behaviour being exercised.
+        run: polaris promote 2 --force
+
+      - name: Score, and prove the predictions were logged
+        run: |
+          polaris score --limit 400 --explain
+          python - <<'PY'
+          from sqlalchemy import text
+          from polaris.config import get_settings
+          from polaris.db.engine import get_engine
+
+          settings = get_settings()
+          with get_engine(settings).connect() as connection:
+              row = connection.execute(text(f"""
+                  SELECT COUNT(*) AS n,
+                         COUNT(DISTINCT version) AS versions,
+                         COUNT(*) FILTER (WHERE decision) AS flagged,
+                         MIN(threshold) AS threshold
+                    FROM {settings.ml_schema}.prediction
+              """)).mappings().one()
+
+          assert row["n"] > 0, "scoring recorded no predictions"
+          assert row["versions"] == 1, "predictions attributed to more than one version"
+          assert row["threshold"] is not None, "a prediction without its threshold is not auditable"
+          print(f"{row['n']} predictions logged, {row['flagged']} flagged at "
+                f"threshold {row['threshold']}")
+          PY
+
+      - name: Monitor drift and, where labels have arrived, live performance
+        run: polaris monitor
+
+      - name: The registry must hold exactly one production version
+        run: |
+          polaris models
+          polaris runs
+          python - <<'PY'
+          from polaris.config import get_settings
+          from polaris.registry.store import list_versions
+
+          versions = list_versions("churn-60d", get_settings())
+          serving = [v for v in versions if v.stage == "production"]
+          # Enforced by a partial unique index, not by the application -- this
+          # asserts the invariant actually holds after a promotion cycle.
+          assert len(serving) == 1, f"{len(serving)} versions are in production"
+          print(f"{len(versions)} registered, exactly one serving (v{serving[0].version})")
+          PY
+
+      - name: The API must answer with the serving model
+        run: |
+          nohup polaris serve --host 127.0.0.1 --port 8000 > api.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health || { cat api.log; exit 1; }
+          curl -fsS http://127.0.0.1:8000/api/v1/model
+          curl -fsS http://127.0.0.1:8000/api/v1/economics
+          python - <<'PY'
+          import json, urllib.error, urllib.request
+
+          def post(path, payload):
+              request = urllib.request.Request(
+                  f"http://127.0.0.1:8000{path}",
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.load(response)
+
+          body = post("/api/v1/score-all", {"limit": 50, "explain": True})
+          assert body["scored"] > 0, "the API scored nothing"
+          first = body["predictions"][0]
+          assert 0.0 <= first["probability"] <= 1.0
+          assert first["contributions"], "explanation requested and not returned"
+          # The decision must follow from the threshold, not from a separate
+          # rule that could drift away from it.
+          for prediction in body["predictions"]:
+              assert prediction["decision"] == (
+                  prediction["probability"] >= prediction["threshold"]
+              ), f"{prediction['account_id']}: decision contradicts the threshold"
+          print(f"API scored {body['scored']}, flagged {body['flagged']}, "
+                f"model v{body['version']}")
+          PY
+
+      - name: Upload the API log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-logs
+          path: api.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 5. Container build -- built and smoke-tested, never pushed.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ml-production-platform:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm ml-production-platform:ci --version
+          docker run --rm ml-production-platform:ci features --show
+          # The image must not run as root.
+          test "$(docker run --rm --entrypoint id ml-production-platform:ci -u)" != "0"

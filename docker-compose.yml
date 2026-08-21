@@ -1,0 +1,101 @@
+# =============================================================================
+# Local stack: PostgreSQL, the training/scoring container, and the API.
+#
+#   cp .env.example .env
+#   docker compose up --build
+#
+# The `platform` service runs the whole cycle once -- simulate, build features,
+# train, promote, score -- and exits. The `api` service then serves whatever is
+# in the registry's production stage.
+#
+#   docker compose run --rm platform train --algorithm logistic
+#   docker compose run --rm platform monitor
+#   docker compose run --rm platform models
+#
+# No credential is hard-coded: every value comes from .env, which is
+# git-ignored. The defaults after `:-` are obviously-local placeholders.
+# =============================================================================
+
+x-database-env: &database-env
+  POLARIS_DB_HOST: postgres
+  POLARIS_DB_PORT: 5432
+  POLARIS_DB_NAME: ${POLARIS_DB_NAME:-polaris}
+  POLARIS_DB_USER: ${POLARIS_DB_USER:-polaris_app}
+  POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD:-change_me_local_only}
+  POLARIS_LOG_LEVEL: ${POLARIS_LOG_LEVEL:-INFO}
+  POLARIS_LOG_FORMAT: ${POLARIS_LOG_FORMAT:-text}
+  POLARIS_PROJECT_ROOT: /app
+  # Both containers must agree on where experiments and artefacts live, or a
+  # model trained by one is invisible to the other.
+  POLARIS_MLFLOW_TRACKING_URI: sqlite:////app/data/mlflow.db
+  POLARIS_DATA_DIR: /app/data
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: polaris-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POLARIS_DB_NAME:-polaris}
+      POSTGRES_USER: ${POLARIS_DB_USER:-polaris_app}
+      POSTGRES_PASSWORD: ${POLARIS_DB_PASSWORD:-change_me_local_only}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POLARIS_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POLARIS_DB_USER:-polaris_app} -d ${POLARIS_DB_NAME:-polaris}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polaris-platform
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      POLARIS_N_ACCOUNTS: ${POLARIS_N_ACCOUNTS:-3000}
+      POLARIS_HISTORY_MONTHS: ${POLARIS_HISTORY_MONTHS:-24}
+      POLARIS_RANDOM_SEED: ${POLARIS_RANDOM_SEED:-20260301}
+    volumes:
+      # Models, reports and the tracking store belong on the host: they are
+      # what a person looks at afterwards.
+      - ./data:/app/data
+    command: ["cycle"]
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polaris-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      platform:
+        condition: service_completed_successfully
+    environment:
+      <<: *database-env
+    ports:
+      - "${POLARIS_API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  postgres_data:
+    driver: local
