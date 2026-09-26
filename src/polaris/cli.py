@@ -91,16 +91,28 @@ def doctor() -> None:
     table.add_row("database reachable", "[green]yes[/green]" if reachable else "[red]no[/red]")
     if reachable:
         counts = table_counts(settings)
+        # A reachable database is not an initialised one. Asking the registry
+        # for the serving model before `polaris simulate` has created the
+        # schemas raises "relation does not exist" -- and a diagnostic command
+        # that crashes on the state it exists to diagnose is worse than useless.
+        initialised = f"{settings.ml_schema}.model_version" in counts
+        table.add_row(
+            "schemas",
+            "ready"
+            if initialised
+            else "[yellow]not initialised -- run `polaris simulate`[/yellow]",
+        )
         table.add_row(
             "feature rows", f"{counts.get(f'{settings.feature_schema}.churn_features', 0):,}"
         )
-        production = get_production("churn-60d", settings)
-        table.add_row(
-            "production model",
-            f"v{production.version} ({production.feature_version})"
-            if production
-            else "[yellow]none[/yellow]",
-        )
+        if initialised:
+            production = get_production("churn-60d", settings)
+            table.add_row(
+                "production model",
+                f"v{production.version} ({production.feature_version})"
+                if production
+                else "[yellow]none[/yellow]",
+            )
     console.print(table)
     if not reachable:
         raise typer.Exit(code=EXIT_FAILURE)
