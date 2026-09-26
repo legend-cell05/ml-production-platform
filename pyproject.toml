@@ -28,6 +28,12 @@ dependencies = [
     "pydantic>=2.6,<3.0",
     "pydantic-settings>=2.2,<3.0",
     "mlflow-skinny>=2.12,<4.0",
+    # mlflow-skinny ships the SQLAlchemy tracking store but not the packages it
+    # needs to open one, and the default tracking URI here is sqlite:///.
+    # Without alembic, every MLflow call fails with ModuleNotFoundError on a
+    # machine that does not happen to have full mlflow installed for other
+    # reasons -- which is any clean environment, including CI.
+    "alembic>=1.13,<2.0",
     "fastapi>=0.111,<1.0",
     "uvicorn[standard]>=0.29,<1.0",
     "httpx>=0.27,<1.0",
