@@ -352,7 +352,12 @@ exists because `polaris runs` must work when the tracking store is unreachable â
 operational history should not depend on an experiment tracker being up.
 
 **Cost.** Two places record a run, and they could disagree. The summary is
-written in the same transaction as the registration, so they do not.
+written in the same transaction as the registration, so they do not. And
+`mlflow-skinny` ships the SQLAlchemy tracking store without the packages needed
+to open one: `alembic` is declared explicitly for that reason. It was found by
+CI rather than locally, because the development machine happened to have full
+MLflow installed for unrelated reasons â€” which is the argument for building the
+environment from the manifest in CI rather than trusting the one you have.
 
 **Wrong when.** A managed tracking server becomes part of the deployment, at
 which point the summary table is still the thing the CLI reads.

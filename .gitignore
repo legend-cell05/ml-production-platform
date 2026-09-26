@@ -21,6 +21,9 @@ mlruns/
 mlartifacts/
 mlflow.db
 mlflow.db-*
+# CI and experiments write their own tracking stores beside it
+mlflow-*.db
+mlflow-*.db-*
 *.joblib
 *.pkl
 *.parquet

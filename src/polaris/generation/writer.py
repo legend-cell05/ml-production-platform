@@ -72,8 +72,13 @@ def _records(frame: pd.DataFrame) -> list[dict[str, object]]:
     here rather than at every call site is the difference between one rule and
     six places to forget it.
     """
-    cleaned = frame.astype(object).where(frame.notna(), None)
-    return [{str(k): v for k, v in row.items()} for row in cleaned.to_dict("records")]
+    # Row by row rather than `frame.where(frame.notna(), None)`: the frame-wide
+    # version relies on None being an acceptable `other`, which pandas allows at
+    # runtime and its type stubs do not.
+    return [
+        {str(key): (None if pd.isna(value) else value) for key, value in row.items()}
+        for row in frame.astype(object).to_dict("records")
+    ]
 
 
 _INSERTS: dict[str, str] = {
